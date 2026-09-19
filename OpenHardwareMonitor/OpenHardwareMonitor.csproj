@@ -53,10 +53,6 @@
     <AssemblyName>OpenHardwareMonitor_x86</AssemblyName>
     <PlatformTarget>x86</PlatformTarget>
   </PropertyGroup>
-  <ItemGroup>
-    <PackageReference Include="SergiyE.Common" Version="1.*" />
-    <PackageReference Include="SergiyE.Common.UI" Version="1.*" />
-  </ItemGroup>
   <ItemGroup Condition=" '$(Configuration)' == 'Release'">
     <PackageReference Include="Costura.Fody" Version="4.1.0">
       <PrivateAssets>all</PrivateAssets>
