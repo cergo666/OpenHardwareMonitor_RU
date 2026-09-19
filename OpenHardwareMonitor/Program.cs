@@ -11,7 +11,7 @@ internal static class Program
     {
         Crasher.Listen();
 
-        if (!OSHelper.IsCompatible(false, out string errorMessage, out var fixAction))
+        if (!RegionCompatibility.IsCompatible(false, out string errorMessage, out var fixAction))
         {
             if (fixAction != null)
             {

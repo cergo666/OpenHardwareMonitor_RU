@@ -1,31 +1,116 @@
-name: Auto Build
+name: Sync, Build and Release
 
 on:
+  schedule:
+    # Check parent repo releases/commits every hour
+    - cron: "0 * * * *"
+  workflow_dispatch:
   push:
     branches: [master]
+
+concurrency:
+  group: sync-build-release
+  cancel-in-progress: false
 
 permissions:
   contents: write
 
 jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.sync.outputs.should_build }}
+      sha: ${{ steps.sync.outputs.sha }}
+      upstream_tag: ${{ steps.sync.outputs.upstream_tag }}
+      upstream_sha: ${{ steps.sync.outputs.upstream_sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Sync with upstream
+        id: sync
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/HardwareMonitor/OpenHardwareMonitor.git 2>/dev/null || git remote set-url upstream https://github.com/HardwareMonitor/OpenHardwareMonitor.git
+          git fetch origin master --tags
+          git fetch upstream master --tags
+
+          git checkout master
+          git reset --hard origin/master
+
+          BEFORE="$(git rev-parse HEAD)"
+
+          if [ "$EVENT_NAME" = "schedule" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if ! git merge --no-edit upstream/master; then
+              echo "::error::Merge conflict with HardwareMonitor/OpenHardwareMonitor. Resolve it locally and push."
+              git merge --abort || true
+              exit 1
+            fi
+          fi
+
+          AFTER="$(git rev-parse HEAD)"
+          if [ "$BEFORE" != "$AFTER" ]; then
+            git push origin master
+          fi
+
+          UPSTREAM_SHA="$(git rev-parse upstream/master)"
+          UPSTREAM_TAG="$(gh release view --repo HardwareMonitor/OpenHardwareMonitor --json tagName --jq .tagName)"
+
+          SHOULD_BUILD=false
+          if [ "$EVENT_NAME" = "push" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            SHOULD_BUILD=true
+          fi
+          if [ "$BEFORE" != "$AFTER" ]; then
+            SHOULD_BUILD=true
+          fi
+          if ! git tag --points-at "$AFTER" | grep -q -- '-ru$'; then
+            SHOULD_BUILD=true
+          fi
+
+          echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
+          echo "sha=$AFTER" >> "$GITHUB_OUTPUT"
+          echo "upstream_tag=$UPSTREAM_TAG" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+
+          echo "should_build=$SHOULD_BUILD"
+          echo "sha=$AFTER"
+          echo "upstream_tag=$UPSTREAM_TAG"
+          echo "upstream_sha=$UPSTREAM_SHA"
+
   build:
+    needs: sync
+    if: needs.sync.outputs.should_build == 'true'
     runs-on: windows-2022
     env:
-      # FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+
       - uses: nuget/setup-nuget@v2
       - uses: microsoft/setup-msbuild@v2
         with:
           msbuild-architecture: x64
 
-      - uses: dorny/paths-filter@v3
-        id: changes
-        with:
-          filters: |
-            buildprops:
-              - 'Directory.Build.props'
+      - name: Guard region patch
+        shell: pwsh
+        run: |
+          $hits = Get-ChildItem -Recurse -Filter *.cs |
+            Where-Object { $_.Name -ne "RegionCompatibility.cs" } |
+            Select-String -Pattern "OSHelper\.IsCompatible"
+          if ($hits) {
+            $hits | ForEach-Object { Write-Host "$($_.Path):$($_.LineNumber): $($_.Line.Trim())" }
+            throw "OSHelper.IsCompatible must only be called from RegionCompatibility.cs"
+          }
 
       - name: NuGet restore
         run: nuget restore OpenHardwareMonitor.sln
@@ -39,53 +124,40 @@ jobs:
           msbuild OpenHardwareMonitor.sln /t:restore /p:RestorePackagesConfig=true /p:Configuration=Release /p:Platform="x86"
           msbuild OpenHardwareMonitor.sln /t:Rebuild /p:Configuration=Release /p:Platform="x86" -m
 
-      # - name: Publish build
-      #   uses: actions/upload-artifact@v5
-      #   with:
-      #     name: OpenHardwareMonitor
-      #     path: OpenHardwareMonitor/bin
+      - name: Create zip for each exe
+        shell: pwsh
+        run: |
+          $source = "OpenHardwareMonitor/bin"
+          Get-ChildItem -Path $source -Filter *.exe | ForEach-Object {
+              $zipPath = Join-Path $source ($_.BaseName + ".zip")
+              Compress-Archive -Path $_.FullName -DestinationPath $zipPath -Force
+          }
 
-      # - name: Publish Lib build
-      #   uses: actions/upload-artifact@v5
-      #   with:
-      #     name: OpenHardwareMonitorLib
-      #     path: OpenHardwareMonitorLib/bin
+      - name: Get version from exe
+        id: get_version
+        shell: pwsh
+        run: |
+          $file = Get-Item "OpenHardwareMonitor/bin/OpenHardwareMonitor.exe"
+          $fullVersion = $file.VersionInfo.FileVersion
+          $parts = $fullVersion.Split('.')
+          $shortVersion = "$($parts[0]).$($parts[1]).$($parts[2]).$($parts[3])"
+          echo "version=$shortVersion" >> $env:GITHUB_OUTPUT
 
-      # - name: Create zip for each exe
-      #   run: |
-      #     $source = "OpenHardwareMonitor/bin"
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.get_version.outputs.version }}-ru
+          name: ${{ steps.get_version.outputs.version }}-ru
+          draft: false
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+          body: |
+            Region-unlocked build of Open Hardware Monitor.
 
-      #     Get-ChildItem -Path $source -Filter *.exe | ForEach-Object {
-      #         $exePath = $_.FullName
-      #         $zipPath = Join-Path $source ($_.BaseName + ".zip")
-
-      #         Compress-Archive -Path $exePath -DestinationPath $zipPath -Force
-      #     }
-      #   shell: powershell
-
-
-      # - name: Get version from exe
-      #   id: get_version
-      #   run: |
-      #     $file = Get-Item "OpenHardwareMonitor/bin/OpenHardwareMonitor.exe"
-      #     $fullVersion = $file.VersionInfo.FileVersion
-
-      #     $parts = $fullVersion.Split('.')
-      #     $shortVersion = "$($parts[0]).$($parts[1]).$($parts[2]).$($parts[3])"
-
-      #     echo "version=$shortVersion" >> $env:GITHUB_OUTPUT
-      #   shell: powershell
-
-      # - name: Debug version
-      #   run: |
-      #     echo "version is set: ${{ steps.get_version.outputs.version }}"
-
-      # - name: Create Release
-      #   uses: softprops/action-gh-release@v2
-      #   with:
-      #     tag_name: ${{ steps.get_version.outputs.version }}
-      #     name: Build ${{ steps.get_version.outputs.version }}
-      #     draft: true
-      #     files: |
-      #       OpenHardwareMonitor/bin/*.exe
-      #       OpenHardwareMonitor/bin/*.zip
+            - Upstream: [HardwareMonitor/OpenHardwareMonitor](https://github.com/HardwareMonitor/OpenHardwareMonitor) `${{ needs.sync.outputs.upstream_tag }}` (`${{ needs.sync.outputs.upstream_sha }}`)
+            - Geographic region restriction from SergiyE.Common is ignored; other compatibility checks stay in place.
+          files: |
+            OpenHardwareMonitor/bin/*.exe
+            OpenHardwareMonitor/bin/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -25,7 +25,7 @@ internal static class Ring0
         if (OSHelper.IsUnix)
             return;
 
-        if (!OSHelper.IsCompatible(false, out var _, out var _))
+        if (!OpenHardwareMonitor.RegionCompatibility.IsCompatible(false, out var _, out var _))
             return;
 
         if (_driver != null)
