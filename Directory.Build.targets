@@ -1,0 +1,45 @@
+<Project>
+
+  <!--
+    ============================================================================
+    Fork-only build overrides.
+
+    This file does not exist upstream, so merging upstream never conflicts with it,
+    and the .csproj files can be kept byte-identical to upstream.
+
+    Upstream gets its sergiye.Common code in one of two ways:
+      * SergiyE.Common / SergiyE.Common.UI NuGet packages - they are marked
+        "private library" and contain a geographic region lock ("not compatible
+        with your region"), which is exactly what this fork removes;
+      * $(CommonSourcesDir) = $(MSBuildThisFileDirectory)..\..\common\, a private
+        checkout that lives outside the repository and is not published anywhere.
+
+    This fork keeps its own region-unlocked copies inside each project folder
+    (OpenHardwareMonitor\sergiye.Common, OpenHardwareMonitorLib\sergiye.Common),
+    which the SDK globs automatically. Both upstream mechanisms are neutralised
+    here, after the .csproj has been evaluated, so any future upstream change or
+    badly resolved merge in that area cannot bring the region lock back and cannot
+    define the same types twice.
+    ============================================================================
+  -->
+
+  <ItemGroup>
+    <!-- Never restore/reference the region-locked private packages. -->
+    <PackageReference Remove="SergiyE.Common" />
+    <PackageReference Remove="SergiyE.Common.UI" />
+
+    <!-- Never compile the unpublished private common sources. -->
+    <Compile Remove="$(CommonSourcesDir)**\*.cs" Condition="'$(CommonSourcesDir)' != ''" />
+    <EmbeddedResource Remove="$(CommonSourcesDir)**\*.json" Condition="'$(CommonSourcesDir)' != ''" />
+  </ItemGroup>
+
+  <!--
+    Fail with an actionable message instead of a wall of CS0246 "type not found"
+    errors when the fork's own copies disappear (accidental delete, merge mishap).
+  -->
+  <Target Name="ForkGuardRegionUnlockedSourcesExist" BeforeTargets="PrepareForBuild">
+    <Error Condition="('$(MSBuildProjectName)' == 'OpenHardwareMonitor' Or '$(MSBuildProjectName)' == 'OpenHardwareMonitorLib') And !Exists('$(MSBuildProjectDirectory)\sergiye.Common')"
+           Text="Fork override: '$(MSBuildProjectDirectory)\sergiye.Common' is missing. It holds the region-unlocked replacements for the private SergiyE.Common package - keep it, and do not bring the SergiyE.* PackageReferences back." />
+  </Target>
+
+</Project>
