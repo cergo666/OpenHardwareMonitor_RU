@@ -51,7 +51,27 @@ jobs:
           if [ "$EVENT_NAME" = "schedule" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             if ! git merge --no-edit upstream/master; then
               echo "::error::Merge conflict with HardwareMonitor/OpenHardwareMonitor. Resolve it locally and push."
+              git diff --name-only --diff-filter=U | sed 's/^/conflicted: /'
+              echo "Fork rule: the two .csproj files are kept byte-identical to upstream; all fork-only build"
+              echo "overrides live in Directory.Build.targets. If only those two files conflicted, resolve with:"
+              echo "  git checkout --theirs -- OpenHardwareMonitor/OpenHardwareMonitor.csproj OpenHardwareMonitorLib/OpenHardwareMonitorLib.csproj"
               git merge --abort || true
+              exit 1
+            fi
+
+            # Fork invariant: those two .csproj files must stay identical to upstream. Upstream keeps editing
+            # their PackageReference section, and any fork-only edit there turns into a merge conflict that
+            # silently stops the hourly releases. Fork MSBuild overrides belong in Directory.Build.targets,
+            # a file upstream does not have, so it can never conflict.
+            FORK_TOUCHED="$(git diff --name-only upstream/master HEAD -- OpenHardwareMonitor/OpenHardwareMonitor.csproj OpenHardwareMonitorLib/OpenHardwareMonitorLib.csproj)"
+            if [ -n "$FORK_TOUCHED" ]; then
+              echo "::error::Fork-only edits found in: $FORK_TOUCHED. These files must stay identical to upstream."
+              echo "Move the override into Directory.Build.targets instead (see the comment in that file)."
+              exit 1
+            fi
+            if ! git cat-file -e HEAD:Directory.Build.targets 2>/dev/null; then
+              echo "::error::Directory.Build.targets is missing. It is what keeps the region-locked SergiyE.Common"
+              echo "packages out of the build - restore it, do not delete it."
               exit 1
             fi
           fi
@@ -111,8 +131,17 @@ jobs:
             throw "Geographic region lock must not be present in the sources"
           }
 
-      - name: NuGet restore
-        run: nuget restore OpenHardwareMonitor.sln
+      - name: Guard restored packages
+        shell: pwsh
+        run: |
+          # SergiyE.Common / SergiyE.Common.UI are upstream's own copy of sergiye.Common and they contain the
+          # geographic region lock. Directory.Build.targets strips them; if anything brings them back (a hand
+          # edit, a package that pulls them in transitively), say so before wasting a build.
+          $hits = Get-ChildItem -Recurse -Filter project.assets.json | Select-String -Pattern "SergiyE"
+          if ($hits) {
+            $hits | Select-Object -First 10 | ForEach-Object { Write-Host "$($_.Path):$($_.LineNumber): $($_.Line.Trim())" }
+            throw "The region-locked SergiyE.* packages ended up in the dependency graph"
+          }
 
       - name: Build
         run: |
@@ -122,6 +151,25 @@ jobs:
           msbuild OpenHardwareMonitor.sln /t:Rebuild /p:Configuration=Release /p:Platform="x64" -m
           msbuild OpenHardwareMonitor.sln /t:restore /p:RestorePackagesConfig=true /p:Configuration=Release /p:Platform="x86"
           msbuild OpenHardwareMonitor.sln /t:Rebuild /p:Configuration=Release /p:Platform="x86" -m
+
+      - name: Guard built binaries
+        shell: pwsh
+        run: |
+          # Last line of defence. Costura.Fody embeds every dependency into the exe, so whatever route the
+          # region lock takes back in (NuGet package, merged sources, renamed copy) the marker string shows up
+          # in the shipped binary - grepping .cs sources alone cannot see that.
+          $patterns = @("not compatible with your region", "GetCultureNames", "SergiyE")
+          $bad = @()
+          foreach ($exe in Get-ChildItem "OpenHardwareMonitor/bin" -Filter *.exe) {
+            $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($exe.FullName))
+            foreach ($pattern in $patterns) {
+              if ($text.Contains($pattern)) { $bad += "$($exe.Name): $pattern" }
+            }
+          }
+          if ($bad) {
+            $bad | ForEach-Object { Write-Host $_ }
+            throw "Region-locked code is present in the built binaries"
+          }
 
       - name: Create zip for each exe
         shell: pwsh
@@ -160,3 +208,43 @@ jobs:
             OpenHardwareMonitor/bin/*.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # A broken sync used to be invisible: the merge conflict just failed the job and the
+  # releases silently stopped for weeks. This job turns any such breakage into an issue
+  # on the fork and closes it again as soon as the pipeline goes green.
+  pipeline_status:
+    needs: [sync, build]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      LABEL: fork-sync-broken
+    steps:
+      - name: Open an issue when sync or build fails
+        if: ${{ needs.sync.result == 'failure' || needs.build.result == 'failure' }}
+        run: |
+          set -euo pipefail
+          gh label create "$LABEL" --repo "$GITHUB_REPOSITORY" --color B60205 \
+            --description "Hourly upstream sync/build of the fork is broken" --force
+          OPEN="$(gh issue list --repo "$GITHUB_REPOSITORY" --label "$LABEL" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$OPEN" ]; then
+            echo "issue #$OPEN is already open, not creating another one"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --label "$LABEL" \
+              --title "Sync/build pipeline is failing" \
+              --body "sync job: ${{ needs.sync.result }}, build job: ${{ needs.build.result }}.
+              Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+              Fork overrides live in Directory.Build.targets; the two .csproj files must stay identical to upstream."
+          fi
+
+      - name: Close the issue when the pipeline is green again
+        if: ${{ needs.sync.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+        run: |
+          set -euo pipefail
+          for number in $(gh issue list --repo "$GITHUB_REPOSITORY" --label "$LABEL" --state open --json number --jq '.[].number'); do
+            gh issue close "$number" --repo "$GITHUB_REPOSITORY" \
+              --comment "Green again: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          done
