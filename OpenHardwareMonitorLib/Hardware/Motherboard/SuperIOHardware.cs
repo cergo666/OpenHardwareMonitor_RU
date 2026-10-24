@@ -1073,6 +1073,7 @@ internal sealed class SuperIOHardware : Hardware
 
                         break;
 
+                    case Model.EX58_UD5: // IT8720F
                     case Model.EX58_EXTREME: // IT8720F
                         v.Add(new Voltage("Vcore", 0));
                         v.Add(new Voltage("DIMM", 1));
@@ -1085,6 +1086,12 @@ internal sealed class SuperIOHardware : Hardware
                         f.Add(new Fan("System Fan #2", 1));
                         f.Add(new Fan("Power Fan", 2));
                         f.Add(new Fan("System Fan #1", 3));
+
+                        // usually CPU_FAN and SYS_FAN2 can be controlled
+                        // on some mainboards PWR_FAN (2) controlls CPU_FAN (0)
+                        // default detection to assign available controls manually
+                        for (int i = 0; i < superIO.Controls.Length; i++)
+                            c.Add(new Control("Fan #" + (i + 1), i));
 
                         break;
 
@@ -1431,6 +1438,7 @@ internal sealed class SuperIOHardware : Hardware
                         break;
 
                     case Model.TUF_X470_PLUS_GAMING: // IT8665E
+                    case Model.ROG_STRIX_B450_F_GAMING: // IT8665E
                         v.Add(new Voltage("Vcore", 0));
                         v.Add(new Voltage("Southbridge 2.5V", 1));
                         v.Add(new Voltage("+12V", 2, 5, 1));
